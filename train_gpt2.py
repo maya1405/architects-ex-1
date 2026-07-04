@@ -35,10 +35,13 @@ class CausalSelfAttention(nn.Module):
         k = k.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         q = q.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
         v = v.view(B, T, self.n_head, C // self.n_head).transpose(1, 2) # (B, nh, T, hs)
+
         att = (q @ k.transpose(-2, -1)) * (1.0 / math.sqrt(k.size(-1)))
         att = att.masked_fill(self.bias[:,:,:T,:T] == 0, float('-inf'))
         att = F.softmax(att, dim=-1)
         y = att @ v # (B, nh, T, T) x (B, nh, T, hs) -> (B, nh, T, hs)
+        #y = F.scaled_dot_product_attention(q, k, v, is_causal=False)
+
         y = y.transpose(1, 2).contiguous().view(B, T, C) # re-assemble all head outputs side by side
         # output projection
         y = self.c_proj(y)
@@ -242,7 +245,7 @@ class DataLoaderLite:
         self.tokens = load_tokens(self.shards[self.current_shard])
         self.current_position = self.B * self.T * self.process_rank
 
-    def next_batch(self):
+    def next_batch(self, device=None):
         B, T = self.B, self.T
         buf = self.tokens[self.current_position : self.current_position+B*T+1]
         x = (buf[:-1]).view(B, T) # inputs
@@ -254,6 +257,9 @@ class DataLoaderLite:
             self.current_shard = (self.current_shard + 1) % len(self.shards)
             self.tokens = load_tokens(self.shards[self.current_shard])
             self.current_position = B * T * self.process_rank
+        if device:
+            x = x.to(device)
+            y = y.to(device)
         return x, y
 
 
@@ -316,6 +322,7 @@ torch.set_float32_matmul_precision('high')
 model = GPT(GPTConfig(vocab_size=50304))
 # model = GPT.from_pretrained("gpt2") # or init from OpenAI GPT-2
 model.to(device)
+#model = torch.compile(model)
 max_lr = 6e-4
 min_lr = max_lr * 0.1
 warmup_steps = 715
@@ -348,9 +355,24 @@ for step in range(max_steps):
     t0 = time.time()
     last_step = (step == max_steps - 1)
 
-    
+    lr = get_lr(step)
+    for param_group in optimizer.param_groups:
+        param_group['lr'] = lr
+
     # TODO: Implement the training step
-    
+    data_x, data_y = train_loader.next_batch(device=device_type)
+    #with torch.autocast(device_type=device_type, dtype=torch.bfloat16):
+    logits, loss = model(data_x, data_y)
+    optimizer.zero_grad()
+    loss.backward()
+    norm = torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+    optimizer.step()
+    #if (max_steps % 10 == 0):
+    #    with torch.no_grad():
+    #        val_x, val_y = val_loader.next_batch(device=device_type)
+    #        _, val_loss = model(val_x, val_y)
+    #    print(f"step {step:5d}, val_loss {val_loss.item():.6f}")
+
     
     if device_type == "cuda":
         torch.cuda.synchronize() # wait for the GPU to finish work
